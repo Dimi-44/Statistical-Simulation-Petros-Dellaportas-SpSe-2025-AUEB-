@@ -1,119 +1,213 @@
 library(mvtnorm)
 library(coda)
-library(MASS)
 library(ggplot2)
-# Set seed for reproducibility
+
 set.seed(123)
 
-# Parameters
+# =============================================================================
+# GLOBAL PARAMETERS & TARGET DISTRIBUTION (d = 100 Anisotropic Gaussian)
+# =============================================================================
 d <- 100
-s <- 0.01 * (1:d)
+s <- 0.01 * (1:d)          # Standard deviations: range from 0.01 to 1.0
 Sigma <- diag(s^2)
-Sigma_inv <- diag(1/s^2)
-n_iter <- 1000
-burn_in <- 100
-M <- 100  # Number of independent MCMC runs
-n_values <- c(0.1, 1, 10)  # Values of n to test for control variates
+Sigma_inv <- diag(1 / s^2)
 
-# Optimal gamma for GI-MALA
-gamma_gi_mala <- 1
-
-# Log-density and gradient functions
-log_pi <- function(x) -0.5 * t(x) %*% Sigma_inv %*% x - 0.5 * sum(log(s^2)) - 0.5 * d * log(2 * pi)
-grad_log_pi <- function(x) as.vector(-Sigma_inv %*% x)
-
-# Proposal function for GI-MALA
-gi_mala_proposal <- function(x, gamma) {
-  as.vector(rmvnorm(1, mean = x + gamma * Sigma %*% grad_log_pi(x), sigma = (2 * gamma - gamma^2) * Sigma))
+# Target log-density and gradient
+log_pi <- function(x) {
+  -0.5 * sum((x / s)^2) - 0.5 * sum(log(s^2)) - 0.5 * d * log(2 * pi)
 }
 
-# Log-proposal density for GI-MALA
-log_proposal_density <- function(y, x, gamma) {
-  mu <- x + gamma * Sigma %*% grad_log_pi(x)
-  dmvnorm(y, mean = mu, sigma = (2 * gamma - gamma^2) * Sigma, log = TRUE)
+grad_log_pi <- function(x) {
+  -x / (s^2)
 }
 
-# Control variate functions
-h_x <- function(x, n) {
-  x * exp(-x^2 / n)  # h_i(x) = x_i * exp(-x_i^2/n) for F(x) = x
-}
+# =============================================================================
+# PART (i): METROPOLIS-HASTINGS ALGORITHM SAMPLERS
+# =============================================================================
 
-E_x2_exp <- function(s_i, n) {
-  n * s_i^2 / (2 * s_i^2 + n)  # E[x_i^2 * exp(-x_i^2/n)]
-}
-
-h_xxT_diag <- function(x_i, s_i, n) {
-  x_i^2 * exp(-x_i^2 / n) - E_x2_exp(s_i, n)  # For xx^T diagonal
-}
-
-h_xxT_offdiag <- function(x_i, x_j, n) {
-  x_i * x_j * exp(-(x_i^2 + x_j^2) / n)  # For xx^T off-diagonal
-}
-
-# Modified MH algorithm to compute estimators
-mh_algorithm <- function(gamma, type, n) {
+# (A) Random Walk Metropolis (RWM)
+run_rwm <- function(n_iter, sigma_step) {
   x <- rep(0, d)
   chain <- matrix(NA, n_iter, d)
   accept <- 0
   
   for (i in 1:n_iter) {
-    y <- gi_mala_proposal(x, gamma)
-    log_alpha <- log_pi(y) - log_pi(x) + 
-                 log_proposal_density(x, y, gamma) - 
-                 log_proposal_density(y, x, gamma)
-    if (runif(1) < min(1, exp(log_alpha))) {
+    y <- x + rnorm(d, mean = 0, sd = sigma_step)
+    log_alpha <- log_pi(y) - log_pi(x)
+    
+    if (log(runif(1)) < log_alpha) {
       x <- y
       accept <- accept + 1
     }
     chain[i, ] <- x
   }
+  list(chain = chain, ar = accept / n_iter)
+}
+
+# (B) Standard Metropolis Adjusted Langevin Algorithm (MALA)
+run_mala <- function(n_iter, dt) {
+  x <- rep(0, d)
+  chain <- matrix(NA, n_iter, d)
+  accept <- 0
   
-  # Use post-burn-in samples
-  chain_post_burn <- chain[-(1:burn_in), ]
-  N_eff <- nrow(chain_post_burn)
+  for (i in 1:n_iter) {
+    grad_x <- grad_log_pi(x)
+    mu_y <- x + 0.5 * (dt^2) * grad_x
+    y <- mu_y + rnorm(d, mean = 0, sd = dt)
+    
+    grad_y <- grad_log_pi(y)
+    mu_x <- y + 0.5 * (dt^2) * grad_y
+    
+    log_q_yx <- -0.5 * sum(((y - mu_y) / dt)^2)
+    log_q_xy <- -0.5 * sum(((x - mu_x) / dt)^2)
+    
+    log_alpha <- log_pi(y) - log_pi(x) + log_q_xy - log_q_yx
+    
+    if (log(runif(1)) < log_alpha) {
+      x <- y
+      accept <- accept + 1
+    }
+    chain[i, ] <- x
+  }
+  list(chain = chain, ar = accept / n_iter)
+}
+
+# (C) Gaussian Invariant MALA (GI-MALA)
+run_gi_mala <- function(n_iter, gamma) {
+  x <- rep(0, d)
+  chain <- matrix(NA, n_iter, d)
+  accept <- 0
   
-  # Standard Monte Carlo estimates
-  est_x <- colMeans(chain_post_burn)  # For F(x) = x
-  est_xxT_11 <- mean(chain_post_burn[,1]^2)  # xx^T (1,1)
-  est_xxT_100100 <- mean(chain_post_burn[,100]^2)  # xx^T (100,100)
-  est_xxT_12 <- mean(chain_post_burn[,1] * chain_post_burn[,2])  # xx^T (1,2)
+  prop_sd <- sqrt(2 * gamma - gamma^2) * s
   
-  # Control variate for F(x) = x
-  h_x_values <- t(apply(chain_post_burn, 1, h_x, n = n))  # N_eff x d
-  cov_x_h <- colMeans(chain_post_burn * h_x_values - 
-                      colMeans(chain_post_burn) * colMeans(h_x_values))
-  var_h <- apply(h_x_values, 2, var) * (N_eff - 1) / N_eff
-  c_opt <- cov_x_h / var_h
-  est_x_cv <- est_x - c_opt * colMeans(h_x_values)
+  for (i in 1:n_iter) {
+    grad_x <- grad_log_pi(x)
+    mu_y <- x + gamma * (s^2) * grad_x
+    y <- mu_y + rnorm(d, mean = 0, sd = prop_sd)
+    
+    grad_y <- grad_log_pi(y)
+    mu_x <- y + gamma * (s^2) * grad_y
+    
+    log_q_yx <- -0.5 * sum(((y - mu_y) / prop_sd)^2)
+    log_q_xy <- -0.5 * sum(((x - mu_x) / prop_sd)^2)
+    
+    log_alpha <- log_pi(y) - log_pi(x) + log_q_xy - log_q_yx
+    
+    if (log(runif(1)) < log_alpha) {
+      x <- y
+      accept <- accept + 1
+    }
+    chain[i, ] <- x
+  }
+  list(chain = chain, ar = accept / n_iter)
+}
+
+# =============================================================================
+# PART (i) BENCHMARK EXECUTION & COMPARISON
+# =============================================================================
+cat("\n=================================================================\n")
+cat("  PART (i): BENCHMARKING THREE METROPOLIS-HASTINGS ALGORITHMS    \n")
+cat("=================================================================\n")
+
+n_iter_bench <- 5000
+burn_in_bench <- 1000
+
+# Step sizes tuned for stability/performance
+sigma_rwm <- 0.002 
+dt_mala   <- 0.003 
+gamma_gi  <- 1.0   
+
+res_rwm     <- run_rwm(n_iter_bench, sigma_rwm)
+res_mala    <- run_mala(n_iter_bench, dt_mala)
+res_gi_mala <- run_gi_mala(n_iter_bench, gamma_gi)
+
+# Extract post-burn-in chains
+chain_rwm     <- mcmc(res_rwm$chain[-(1:burn_in_bench), ])
+chain_mala    <- mcmc(res_mala$chain[-(1:burn_in_bench), ])
+chain_gi_mala <- mcmc(res_gi_mala$chain[-(1:burn_in_bench), ])
+
+# Effective Sample Size (ESS)
+ess_rwm     <- effectiveSize(chain_rwm)
+ess_mala    <- effectiveSize(chain_mala)
+ess_gi_mala <- effectiveSize(chain_gi_mala)
+
+summary_df <- data.frame(
+  Algorithm       = c("RWM", "Standard MALA", "GI-MALA"),
+  Acceptance_Rate = c(res_rwm$ar, res_mala$ar, res_gi_mala$ar),
+  Mean_ESS        = c(mean(ess_rwm), mean(ess_mala), mean(ess_gi_mala)),
+  Min_ESS_Dim1    = c(ess_rwm[1], ess_mala[1], ess_gi_mala[1]),
+  Max_ESS_Dim100  = c(ess_rwm[100], ess_mala[100], ess_gi_mala[100])
+)
+
+print(summary_df, row.names = FALSE)
+
+
+# =============================================================================
+# PART (ii): CONTROL VARIATE VARIANCE REDUCTION IN GI-MALA
+# =============================================================================
+cat("\n=================================================================\n")
+cat("  PART (ii): CONTROL VARIATE VARIANCE REDUCTION IN GI-MALA       \n")
+cat("=================================================================\n")
+
+# Control Variate Auxiliary Functions
+h_x <- function(x, n) {
+  x * exp(-x^2 / n)
+}
+
+E_x2_exp <- function(s_i, n) {
+  n * s_i^2 / (2 * s_i^2 + n)
+}
+
+h_xxT_diag <- function(x_i, s_i, n) {
+  x_i^2 * exp(-x_i^2 / n) - E_x2_exp(s_i, n)
+}
+
+h_xxT_offdiag <- function(x_i, x_j, n) {
+  x_i * x_j * exp(-(x_i^2 + x_j^2) / n)
+}
+
+# Monte Carlo estimator with Control Variate calculation
+run_gi_mala_cv <- function(n_iter, burn_in, gamma, n) {
+  res <- run_gi_mala(n_iter, gamma)
+  chain_post <- res$chain[-(1:burn_in), ]
+  N_eff <- nrow(chain_post)
   
-  # Control variate for xx^T (1,1)
-  h_xxT_11 <- sapply(chain_post_burn[,1], h_xxT_diag, s_i = s[1], n = n)
-  cov_xxT_11 <- mean((chain_post_burn[,1]^2 - mean(chain_post_burn[,1]^2)) * 
-                     (h_xxT_11 - mean(h_xxT_11)))
-  var_h_xxT_11 <- var(h_xxT_11) * (N_eff - 1) / N_eff
-  c_opt_11 <- cov_xxT_11 / var_h_xxT_11
-  est_xxT_11_cv <- est_xxT_11 - c_opt_11 * mean(h_xxT_11)
+  # 1. Standard Monte Carlo Estimates
+  est_x          <- colMeans(chain_post)
+  est_xxT_11     <- mean(chain_post[, 1]^2)
+  est_xxT_100100 <- mean(chain_post[, 100]^2)
+  est_xxT_12     <- mean(chain_post[, 1] * chain_post[, 2])
   
-  # Control variate for xx^T (100,100)
-  h_xxT_100 <- sapply(chain_post_burn[,100], h_xxT_diag, s_i = s[100], n = n)
-  cov_xxT_100 <- mean((chain_post_burn[,100]^2 - mean(chain_post_burn[,100]^2)) * 
-                      (h_xxT_100 - mean(h_xxT_100)))
-  var_h_xxT_100 <- var(h_xxT_100) * (N_eff - 1) / N_eff
-  c_opt_100 <- cov_xxT_100 / var_h_xxT_100
-  est_xxT_100100_cv <- est_xxT_100100 - c_opt_100 * mean(h_xxT_100)
+  # 2. Control Variate Estimates for F(x) = x
+  h_x_vals <- t(apply(chain_post, 1, h_x, n = n))
+  cov_x_h  <- colMeans(chain_post * h_x_vals - colMeans(chain_post) * colMeans(h_x_vals))
+  var_h    <- apply(h_x_vals, 2, var) * (N_eff - 1) / N_eff
+  c_opt    <- ifelse(var_h == 0, 0, cov_x_h / var_h)
+  est_x_cv <- est_x - c_opt * colMeans(h_x_vals)
   
-  # Control variate for xx^T (1,2)
-  h_xxT_12 <- mapply(h_xxT_offdiag, chain_post_burn[,1], chain_post_burn[,2], 
-                     MoreArgs = list(n = n))
-  cov_xxT_12 <- mean((chain_post_burn[,1] * chain_post_burn[,2] - 
-                      mean(chain_post_burn[,1] * chain_post_burn[,2])) * 
-                     (h_xxT_12 - mean(h_xxT_12)))
-  var_h_xxT_12 <- var(h_xxT_12) * (N_eff - 1) / N_eff
-  c_opt_12 <- cov_xxT_12 / var_h_xxT_12
-  est_xxT_12_cv <- est_xxT_12 - c_opt_12 * mean(h_xxT_12)
+  # 3. Control Variate for xx^T (1,1)
+  h_11     <- sapply(chain_post[, 1], h_xxT_diag, s_i = s[1], n = n)
+  cov_11   <- mean((chain_post[, 1]^2 - est_xxT_11) * (h_11 - mean(h_11)))
+  var_h_11 <- var(h_11) * (N_eff - 1) / N_eff
+  c_opt_11 <- ifelse(var_h_11 == 0, 0, cov_11 / var_h_11)
+  est_xxT_11_cv <- est_xxT_11 - c_opt_11 * mean(h_11)
+  
+  # 4. Control Variate for xx^T (100,100)
+  h_100     <- sapply(chain_post[, 100], h_xxT_diag, s_i = s[100], n = n)
+  cov_100   <- mean((chain_post[, 100]^2 - est_xxT_100100) * (h_100 - mean(h_100)))
+  var_h_100 <- var(h_100) * (N_eff - 1) / N_eff
+  c_opt_100 <- ifelse(var_h_100 == 0, 0, cov_100 / var_h_100)
+  est_xxT_100100_cv <- est_xxT_100100 - c_opt_100 * mean(h_100)
+  
+  # 5. Control Variate for xx^T (1,2)
+  h_12     <- mapply(h_xxT_offdiag, chain_post[, 1], chain_post[, 2], MoreArgs = list(n = n))
+  cov_12   <- mean((chain_post[, 1] * chain_post[, 2] - est_xxT_12) * (h_12 - mean(h_12)))
+  var_h_12 <- var(h_12) * (N_eff - 1) / N_eff
+  c_opt_12 <- ifelse(var_h_12 == 0, 0, cov_12 / var_h_12)
+  est_xxT_12_cv <- est_xxT_12 - c_opt_12 * mean(h_12)
   
   list(
-    ar = accept/n_iter,
+    ar = res$ar,
     est_x = est_x, est_x_cv = est_x_cv,
     est_xxT_11 = est_xxT_11, est_xxT_11_cv = est_xxT_11_cv,
     est_xxT_100100 = est_xxT_100100, est_xxT_100100_cv = est_xxT_100100_cv,
@@ -121,97 +215,61 @@ mh_algorithm <- function(gamma, type, n) {
   )
 }
 
-# Run M simulations for each n and compute variances
-results <- lapply(n_values, function(n) {
-  run_results <- replicate(M, mh_algorithm(gamma_gi_mala, "gi_mala", n), 
-                          simplify = FALSE)
+# Run M independent runs across different n values
+M <- 100
+n_iter_cv <- 1000
+burn_in_cv <- 100
+n_values <- c(0.1, 1, 10)
+
+cv_results <- lapply(n_values, function(n_val) {
+  runs <- replicate(M, run_gi_mala_cv(n_iter_cv, burn_in_cv, gamma_gi, n_val), simplify = FALSE)
   
-  # Extract estimates
-  est_x <- t(sapply(run_results, function(r) r$est_x))
-  est_x_cv <- t(sapply(run_results, function(r) r$est_x_cv))
-  est_xxT_11 <- sapply(run_results, function(r) r$est_xxT_11)
-  est_xxT_11_cv <- sapply(run_results, function(r) r$est_xxT_11_cv)
-  est_xxT_100100 <- sapply(run_results, function(r) r$est_xxT_100100)
-  est_xxT_100100_cv <- sapply(run_results, function(r) r$est_xxT_100100_cv)
-  est_xxT_12 <- sapply(run_results, function(r) r$est_xxT_12)
-  est_xxT_12_cv <- sapply(run_results, function(r) r$est_xxT_12_cv)
+  # Extract estimates across M runs
+  est_x          <- t(sapply(runs, function(r) r$est_x))
+  est_x_cv       <- t(sapply(runs, function(r) r$est_x_cv))
+  est_xxT_11     <- sapply(runs, function(r) r$est_xxT_11)
+  est_xxT_11_cv  <- sapply(runs, function(r) r$est_xxT_11_cv)
+  est_xxT_100100 <- sapply(runs, function(r) r$est_xxT_100100)
+  est_xxT_100100_cv <- sapply(runs, function(r) r$est_xxT_100100_cv)
+  est_xxT_12     <- sapply(runs, function(r) r$est_xxT_12)
+  est_xxT_12_cv  <- sapply(runs, function(r) r$est_xxT_12_cv)
   
   # Compute variances
-  var_x <- apply(est_x, 2, var)
-  var_x_cv <- apply(est_x_cv, 2, var)
-  var_xxT_11 <- var(est_xxT_11)
-  var_xxT_11_cv <- var(est_xxT_11_cv)
+  var_x          <- apply(est_x, 2, var)
+  var_x_cv       <- apply(est_x_cv, 2, var)
+  var_xxT_11     <- var(est_xxT_11)
+  var_xxT_11_cv  <- var(est_xxT_11_cv)
   var_xxT_100100 <- var(est_xxT_100100)
   var_xxT_100100_cv <- var(est_xxT_100100_cv)
-  var_xxT_12 <- var(est_xxT_12)
-  var_xxT_12_cv <- var(est_xxT_12_cv)
+  var_xxT_12     <- var(est_xxT_12)
+  var_xxT_12_cv  <- var(est_xxT_12_cv)
   
-  # Average acceptance rate
-  ar <- mean(sapply(run_results, function(r) r$ar))
-  
-  return(list(
-    n = n,
-    ar = ar,
-    var_x = var_x, var_x_cv = var_x_cv,
-    var_xxT_11 = var_xxT_11, var_xxT_11_cv = var_xxT_11_cv,
-    var_xxT_100100 = var_xxT_100100, var_xxT_100100_cv = var_xxT_100100_cv,
-    var_xxT_12 = var_xxT_12, var_xxT_12_cv = var_xxT_12_cv
-  ))
+  list(
+    n = n_val,
+    mean_var_x = mean(var_x), mean_var_x_cv = mean(var_x_cv),
+    var_11 = var_xxT_11, var_11_cv = var_xxT_11_cv,
+    var_100 = var_xxT_100100, var_100_cv = var_xxT_100100_cv,
+    var_12 = var_xxT_12, var_12_cv = var_xxT_12_cv
+  )
 })
 
-# Summarize results
-cat("Variance Reduction Results for GI-MALA (n_iter = 1000, M = 100):\n")
-for (res in results) {
-  cat(sprintf("\nn = %g\n", res$n))
-  cat(sprintf("Average Acceptance Rate: %g\n", res$ar))
-  cat("F(x) = x (mean variance across dimensions):\n")
-  cat(sprintf("Standard MC: %g\n", mean(res$var_x)))
-  cat(sprintf("Control Variate: %g\n", mean(res$var_x_cv)))
-  cat(sprintf("Reduction: %g%%\n", 100 * (mean(res$var_x) - mean(res$var_x_cv)) / mean(res$var_x)))
+# Print Results
+for (res in cv_results) {
+  cat(sprintf("\n--- Results for Control Variate Tuning Scale n = %g ---\n", res$n))
   
-  cat("F(x) = xx^T (1,1):\n")
-  cat(sprintf("Standard MC: %g\n", res$var_xxT_11))
-  cat(sprintf("Control Variate: %g\n", res$var_xxT_11_cv))
-  cat(sprintf("Reduction: %g%%\n", 100 * (res$var_xxT_11 - res$var_xxT_11_cv) / res$var_xxT_11))
+  pct_x <- 100 * (res$mean_var_x - res$mean_var_x_cv) / res$mean_var_x
+  cat(sprintf("F(x) = x (Mean Var Across Dimensions):\n  Standard MC: %.6e | CV: %.6e | Reduction: %.2f%%\n",
+              res$mean_var_x, res$mean_var_x_cv, pct_x))
   
-  cat("F(x) = xx^T (100,100):\n")
-  cat(sprintf("Standard MC: %g\n", res$var_xxT_100100))
-  cat(sprintf("Control Variate: %g\n", res$var_xxT_100100_cv))
-  cat(sprintf("Reduction: %g%%\n", 100 * (res$var_xxT_100100 - res$var_xxT_100100_cv) / res$var_xxT_100100))
+  pct_11 <- 100 * (res$var_11 - res$var_11_cv) / res$var_11
+  cat(sprintf("F(x) = xx^T (1,1):\n  Standard MC: %.6e | CV: %.6e | Reduction: %.2f%%\n",
+              res$var_11, res$var_11_cv, pct_11))
   
-  cat("F(x) = xx^T (1,2):\n")
-  cat(sprintf("Standard MC: %g\n", res$var_xxT_12))
-  cat(sprintf("Control Variate: %g\n", res$var_xxT_12_cv))
-  cat(sprintf("Reduction: %g%%\n", 100 * (res$var_xxT_12 - res$var_xxT_12_cv) / res$var_xxT_12))
+  pct_100 <- 100 * (res$var_100 - res$var_100_cv) / res$var_100
+  cat(sprintf("F(x) = xx^T (100,100):\n  Standard MC: %.6e | CV: %.6e | Reduction: %.2f%%\n",
+              res$var_100, res$var_100_cv, pct_100))
+  
+  pct_12 <- 100 * (res$var_12 - res$var_12_cv) / res$var_12
+  cat(sprintf("F(x) = xx^T (1,2):\n  Standard MC: %.6e | CV: %.6e | Reduction: %.2f%%\n",
+              res$var_12, res$var_12_cv, pct_12))
 }
-
-
-library(ggplot2)
-
-# Data from provided results
-results <- list(
-  list(
-    n = 0.1,
-    var_x = 0.000376327, var_x_cv = 0.000342864,
-    var_xxT_11 = 1.70798e-11, var_xxT_11_cv = 2.75506e-16,
-    var_xxT_100100 = 0.00205851, var_xxT_100100_cv = 0.0031882,
-    var_xxT_12 = 5.05443e-11, var_xxT_12_cv = 5.23725e-15
-  ),
-  list(
-    n = 1,
-    var_x = 0.000377875, var_x_cv = 0.000148285,
-    var_xxT_11 = 2.32793e-11, var_xxT_11_cv = 2.59525e-18,
-    var_xxT_100100 = 0.00159223, var_xxT_100100_cv = 0.00102077,
-    var_xxT_12 = 4.4299e-11, var_xxT_12_cv = 4.52837e-17
-  ),
-  list(
-    n = 10,
-    var_x = 0.000370942, var_x_cv = 7.57708e-06,
-    var_xxT_11 = 1.67181e-11, var_xxT_11_cv = 2.85198e-20,
-    var_xxT_100100 = 0.00275132, var_xxT_100100_cv = 0.000363311,
-    var_xxT_12 = 5.08204e-11, var_xxT_12_cv = 5.31915e-19
-  )
-)
-
-
-
