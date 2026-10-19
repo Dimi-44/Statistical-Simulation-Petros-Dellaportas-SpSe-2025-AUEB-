@@ -2,331 +2,293 @@
 ############## The Delaporte Distribution: A great risk story ################
 ##############################################################################
 
-######Task 1: simple simulation process ######
-# Set seed for reproducibility
+#No MCMC approach
+
 set.seed(123)
 
-# Parameters for Delaporte distribution
-r <- 2
-p <- 0.5
-lambda <- 3
+# 1. True parameters and theoretical moments
+r_true <- 2
+p_true <- 0.5
+lambda_true <- 3
 n <- 100
-theoretical_mean <- lambda + r * (1 - p) / p
-theoretical_variance <- lambda + r * (1 - p) / (p^2)
 
-sample_mean<-rep(0,10000)
-sample_variance<-rep(0,10000)
-for (i in 1:10000) {
-# Simulate Negative Binomial and Poisson components
-Y1 <- rnbinom(n, size = r, prob = p)  # Negative Binomial(r, p)
-Y2 <- rpois(n, lambda = lambda)       # Poisson(lambda)
-Y1;Y2
-# Sum to obtain Delaporte samples
-X <- Y1 + Y2
-sample_mean[i] <- mean(X)
-sample_variance[i] <- var(X)
+theoretical_mean <- lambda_true +
+  r_true * (1 - p_true) / p_true
+
+theoretical_variance <- lambda_true +
+  r_true * (1 - p_true) / p_true^2
+
+cat("Theoretical mean:", theoretical_mean, "\n")
+cat("Theoretical variance:", theoretical_variance, "\n")
+
+# 2. Simulate Delaporte observations
+Y <- rnbinom(n, size = r_true, prob = p_true)
+Z <- rpois(n, lambda = lambda_true)
+X <- Y + Z
+
+cat("Observed sample mean:", mean(X), "\n")
+cat("Observed sample variance:", var(X), "\n")
+
+# 3. Numerically stable log-sum-exp
+log_sum_exp <- function(a) {
+  m <- max(a)
+  if (!is.finite(m)) return(m)
+  m + log(sum(exp(a - m)))
 }
-mean(sample_mean);mean(sample_variance)
 
-######Task 2.1: Gibbs with rejection!!!######
+# 4. Negative log-likelihood
+# Optimize unconstrained parameters:
+# eta[1] = log(r), eta[2] = logit(p), eta[3] = log(lambda)
 
-# Revised Gibbs Sampler for Delaporte Parameter Estimation
+negative_loglik <- function(eta, x) {
+
+  r <- exp(eta[1])
+  p <- plogis(eta[2])
+  lambda <- exp(eta[3])
+
+  loglik_i <- vapply(x, function(xi) {
+
+    y <- 0:xi
+
+    log_terms <-
+      dnbinom(y, size = r, prob = p, log = TRUE) +
+      dpois(xi - y, lambda = lambda, log = TRUE)
+
+    log_sum_exp(log_terms)
+
+  }, numeric(1))
+
+  if (any(!is.finite(loglik_i))) return(1e100)
+
+  -sum(loglik_i)
+}
+
+# 5. Estimate parameters by MLE
+initial <- c(
+  log(2),
+  qlogis(0.5),
+  log(3)
+)
+
+fit <- optim(
+  par = initial,
+  fn = negative_loglik,
+  x = X,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 5000, reltol = 1e-10)
+)
+
+estimates <- c(
+  r = exp(fit$par[1]),
+  p = plogis(fit$par[2]),
+  lambda = exp(fit$par[3])
+)
+
+cat("\nOptimization convergence code:", fit$convergence, "\n")
+cat("0 indicates that optim reports successful convergence.\n")
+cat("\nTrue parameters:\n")
+print(c(r = r_true, p = p_true, lambda = lambda_true))
+
+cat("\nMLE estimates:\n")
+print(estimates)
+
+cat("\nMaximized log-likelihood:", -fit$value, "\n")
+
+# 6. Compare fitted and theoretical moments
+fitted_mean <- estimates["lambda"] +
+  estimates["r"] * (1 - estimates["p"]) / estimates["p"]
+
+fitted_variance <- estimates["lambda"] +
+  estimates["r"] * (1 - estimates["p"]) / estimates["p"]^2
+
+cat("\nFitted theoretical mean:", fitted_mean, "\n")
+cat("Fitted theoretical variance:", fitted_variance, "\n")
+
+# 7. Compare observed and fitted frequencies
+max_count <- max(X)
+counts <- 0:max_count
+
+observed_freq <- tabulate(X + 1, nbins = max_count + 1)
+fitted_prob <- vapply(counts, function(k) {
+  log_terms <- dnbinom(
+    0:k,
+    size = estimates["r"],
+    prob = estimates["p"],
+    log = TRUE
+  ) + dpois(
+    k - (0:k),
+    lambda = estimates["lambda"],
+    log = TRUE
+  )
+  exp(log_sum_exp(log_terms))
+}, numeric(1))
+
+comparison <- data.frame(
+  Count = counts,
+  Observed = observed_freq,
+  Expected = n * fitted_prob
+)
+
+print(comparison)
+
+# Visual comparison
+plot(
+  counts, observed_freq,
+  type = "h", lwd = 3,
+  xlab = "Simulated count",
+  ylab = "Frequency",
+  main = "Observed versus fitted Delaporte distribution"
+)
+
+points(
+  counts, n * fitted_prob,
+  pch = 19
+)
+
+legend(
+  "topright",
+  legend = c("Observed", "Fitted expected frequency"),
+  lty = c(1, NA),
+  pch = c(NA, 19),
+  bty = "n"
+)
+
+
+#Gibbs Sampler approach 
+library(coda)
+
 set.seed(123)
 
-# Simulated data (from Task 1)
+# 1. Simulate Toy Delaporte Data (Grecontina)
 n <- 100
 r_true <- 2
 p_true <- 0.5
 lambda_true <- 3
-Y1 <- rnbinom(n, size = r_true, prob = p_true)
-Y2 <- rpois(n, lambda = lambda_true)
-X <- Y1 + Y2
 
-# Initialize parameters closer to true values
-r <- 1.7
-p <- 0.8
-lambda <- 2.6
-Y1 <- pmin(X, rpois(n, lambda))  # Initial latent variables
-n_iter <- 10000
-burn_in <- 3000
-thin <- 40
+Y1_true <- rnbinom(n, size = r_true, prob = p_true)
+Y2_true <- rpois(n, lambda = lambda_true)
+X <- Y1_true + Y2_true
 
-# Storage for samples (adjusted for thinning)
-n_store <- floor((n_iter - burn_in) / thin)
-r_samples <- numeric(n_store)
-p_samples <- numeric(n_store)
-lambda_samples <- numeric(n_store)
-store_idx <- 1
-
-# Function to compute log-binomial coefficient safely
+# 2. Log-binomial coefficient helper
 log_binom <- function(y, r) {
-  if (y < 0 || r <= 0) return(-Inf)
   lgamma(y + r) - lgamma(r) - lgamma(y + 1)
 }
 
-# Rejection sampling for r with Gamma(2, 1) proposal
-sample_r <- function(p, Y1, n) {
-  target <- function(r) {
-    if (r <= 0.01 || r >= 8) return(-Inf)
-    log_p_term <- n * r * log(p)
-    log_prior <- (0.01 - 1) * log(r) - 0.01 * r
-    log_binom_sum <- sum(sapply(Y1, function(y) log_binom(y, r)))
-    log_p_term + log_prior + log_binom_sum
-  }
+# 3. Griddy Gibbs Sampler Function
+run_delaporte_gibbs <- function(X, n_iter = 15000, burn_in = 2000, thin = 1,
+                                init_r = 2, init_p = 0.5, init_lambda = 3) {
+  n <- length(X)
+  r <- init_r
+  p <- init_p
+  lambda <- init_lambda
+  Y1 <- pmin(X, rpois(n, lambda))
   
-  # Proposal: Gamma(2, 1)
-  proposal <- function() rgamma(1, shape = 2, rate = 1)
-  log_proposal <- function(r) dgamma(r, shape = 2, rate = 1, log = TRUE)
+  n_store <- floor((n_iter - burn_in) / thin)
+  samples <- matrix(NA, nrow = n_store, ncol = 3)
+  colnames(samples) <- c("r", "p", "lambda")
   
-  # Numerically find M
-  log_f <- function(r) target(r) - log_proposal(r)
-  opt <- optimize(log_f, interval = c(0.01, 8), maximum = TRUE)
-  log_M <- opt$objective
+  r_grid <- seq(0.05, 12.0, length.out = 300)
+  store_idx <- 1
   
-  # Rejection sampling loop
-  while (TRUE) {
-    r_cand <- proposal()
-    if (r_cand < 0.01 || r_cand > 8) next
-    log_ratio <- log_f(r_cand) - log_M
-    if (is.na(log_ratio) || is.nan(log_ratio)) next
-    if (log(runif(1)) <= log_ratio) return(r_cand)
-  }
-}
-
-# Gibbs Sampler
-for (iter in 1:n_iter) {
-  # Sample Y_{i1}
-  for (i in 1:n) {
-    max_y <- X[i]
-    y_vals <- 0:max_y
-    log_probs <- sapply(y_vals, function(y) {
-      if (y > X[i]) return(-Inf)
-      log_binom(y, r) + y * log(1 - p) + (X[i] - y) * log(lambda) - lfactorial(X[i] - y)
-    })
-    log_probs[!is.finite(log_probs)] <- -Inf
-    if (all(log_probs == -Inf)) log_probs[1] <- 0  # Avoid all -Inf
-    probs <- exp(log_probs - max(log_probs))
-    probs <- pmax(probs, 1e-10)  # Prevent zero probabilities
-    probs <- probs / sum(probs)
-    Y1[i] <- sample(y_vals, 1, prob = probs)
-  }
-  
-  # Sample p ~ Beta(r * n + 1, sum(Y1) + 1)
-  p <- rbeta(1, r * n + 1, sum(Y1) + 1)
-  
-  # Sample lambda ~ Gamma(0.01 + sum(X - Y1), 0.01 + n)
-  lambda <- rgamma(1, shape = 0.01 + sum(X - Y1), rate = 0.01 + n)
-  lambda <- pmin(pmax(lambda, 0.01), 10)  # Bound lambda
-  
-  # Sample r using rejection sampling
-  r <- sample_r(p, Y1, n)
-  
-  # Store samples with thinning
-  if (iter > burn_in && (iter - burn_in) %% thin == 0) {
-    r_samples[store_idx] <- r
-    p_samples[store_idx] <- p
-    lambda_samples[store_idx] <- lambda
-    store_idx <- store_idx + 1
-  }
-
- if (iter %% 100 == 0) {cat(paste0('  iteration: ', iter, '    '), '\r')}
-}
-
-# Summary statistics
-cat("Mean r:", mean(r_samples), "(True:", r_true, ")\n")
-cat("Mean p:", mean(p_samples), "(True:", p_true, ")\n")
-cat("Mean lambda:", mean(lambda_samples), "(True:", lambda_true, ")\n")
-
-
-# Posterior diagnostics and visualization
-par(mar = c(4, 5, 2, 1))
-layout(matrix(1:9, ncol = 3, nrow = 3, byrow = TRUE), widths = c(1.5, 1, 1), heights = c(1, 1, 1))
-
-# r diagnostics
-plot(r_samples, col = "blue", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'r')
-acf(r_samples, lag.max = 100, main = 'r ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(r_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'r', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
-
-# p diagnostics
-plot(p_samples, col = "darkgreen", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'p')
-acf(p_samples, lag.max = 100, main = 'p ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(p_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'p', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
-
-# lambda diagnostics
-plot(lambda_samples, col = "purple", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'lambda')
-acf(lambda_samples, lag.max = 100, main = 'lambda ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(lambda_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'lambda', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
-
-###### "Importance Sampling" ######
-set.seed(123)
-
-# Simulated data
-n <- 100
-r_true <- 2
-p_true <- 0.5
-lambda_true <- 3
-Y1 <- rnbinom(n, size = r_true, prob = p_true)
-Y2 <- rpois(n, lambda = lambda_true)
-X <- Y1 + Y2
-
-# Initialize parameters
-r <- 2
-p <- 0.8
-lambda <- 2.2
-Y1 <- pmin(X, rpois(n, lambda))  # Initial latent variables
-n_iter <- 10000
-burn_in <- 3000
-thin <- 10
-
-# Storage for samples
-n_store <- floor((n_iter - burn_in) / thin)
-r_samples <- numeric(n_store)
-p_samples <- numeric(n_store)
-lambda_samples <- numeric(n_store)
-store_idx <- 1
-
-# Function to compute log-binomial coefficient vectorized
-log_binom <- function(y, r) {
-  ifelse(y < 0 | r <= 0, -Inf, lgamma(y + r) - lgamma(r) - lgamma(y + 1))
-}
-
-# Importance sampling for r with optimized Gamma proposal
-sample_r <- function(p, Y1, n, r_prev, max_r = 10) {
-  K <- 1000  # Reduced from 10,000
-  shape <- 2  # Tuned proposal
-  rate <- 1
-  
-  # Draw candidates
-  r_cands <- rgamma(K, shape = shape, rate = rate)
-  r_cands <- r_cands[r_cands > 0 & r_cands <= max_r]
-  if (length(r_cands) < K) r_cands <- c(r_cands, rep(r_prev, K - length(r_cands)))
-  r_cands <- r_cands[1:K]
-  
-  # Compute log unnormalized target density (vectorized)
-  log_target <- function(r) {
-    if (r <= 0 || r > max_r) return(-Inf)
-    n * r * log(p) + (0.01 - 1) * log(r) - 0.01 * r + sum(log_binom(Y1, r))
-  }
-  log_targets <- vapply(r_cands, log_target, numeric(1))
-  
-  # Compute log proposal density
-  log_proposals <- dgamma(r_cands, shape = shape, rate = rate, log = TRUE)
-  
-  # Compute importance weights
-  log_weights <- log_targets - log_proposals
-  max_log_weight <- max(log_weights, na.rm = TRUE)
-  if (is.infinite(max_log_weight) || all(is.na(log_weights))) return(r_prev)
-  weights <- exp(log_weights - max_log_weight)
-  norm_weights <- weights / sum(weights)
-  
-  # Calculate Effective Sample Size (ESS)
-  ess <- 1 / sum(norm_weights^2)
-  if (ess < 10 || any(is.na(norm_weights))) return(r_prev)
-  
-  # Sample new r
-  r_new <- sample(r_cands, 1, prob = norm_weights)
-  return(r_new)
-}
-
-# Gibbs Sampler
-for (iter in 1:n_iter) {
-  # Sample Y_{i1}
-  for (i in 1:n) {
-    max_y <- X[i]
-    y_vals <- 0:max_y  # Use full range for simplicity
-    log_probs <- vapply(y_vals, function(y) {
-      if (y > X[i]) return(-Inf)
-      log_binom(y, r) +
-        y * log(1 - p) + (X[i] - y) * log(lambda) - lfactorial(X[i] - y)
-    }, numeric(1))
-    log_probs[!is.finite(log_probs)] <- -Inf
-    if (all(log_probs == -Inf)) {
-      log_probs <- rep(-Inf, length(y_vals))  # Ensure same length
-      log_probs[1] <- 0  # Default to y = 0
-    }
-    probs <- exp(log_probs - max(log_probs))
-    probs <- pmax(probs, 1e-10)
-    probs <- probs / sum(probs)
-    # Ensure lengths match
-    if (length(y_vals) != length(probs)) {
-      y_vals <- 0:max_y
-      log_probs <- vapply(y_vals, function(y) {
-        if (y > X[i]) return(-Inf)
-        log_binom(y, r) +
-          y * log(1 - p) + (X[i] - y) * log(lambda) - lfactorial(X[i] - y)
-      }, numeric(1))
-      log_probs[!is.finite(log_probs)] <- -Inf
-      if (all(log_probs == -Inf)) {
-        log_probs <- rep(-Inf, length(y_vals))
-        log_probs[1] <- 0
-      }
+  for (iter in 1:n_iter) {
+    # Step A: Sample Latent Y1_i | X_i, r, p, lambda
+    for (i in 1:n) {
+      y_vals <- 0:X[i]
+      log_p1 <- log_binom(y_vals, r) + r * log(p) + y_vals * log(1 - p)
+      log_p2 <- (X[i] - y_vals) * log(lambda) - lfactorial(X[i] - y_vals) - lambda
+      
+      log_probs <- log_p1 + log_p2
       probs <- exp(log_probs - max(log_probs))
-      probs <- pmax(probs, 1e-10)
       probs <- probs / sum(probs)
+      
+      Y1[i] <- sample(y_vals, size = 1, prob = probs)
     }
-    Y1[i] <- sample(y_vals, 1, prob = probs)
+    
+    # Step B: Sample p | Y1, r ~ Beta(r*n + 1, sum(Y1) + 1)
+    p <- rbeta(1, r * n + 1, sum(Y1) + 1)
+    p <- pmin(pmax(p, 0.001), 0.999)
+    
+    # Step C: Sample lambda | X, Y1 ~ Gamma(2 + sum(X - Y1), 1 + n)
+    lambda <- rgamma(1, shape = 2 + sum(X - Y1), rate = 1 + n)
+    lambda <- pmax(lambda, 0.01)
+    
+    # Step D: Griddy Gibbs for r with Gamma(2, 1) Prior
+    log_dens_r <- sapply(r_grid, function(rg) {
+      log_prior <- (2 - 1) * log(rg) - 1 * rg
+      log_like  <- n * rg * log(p) + sum(log_binom(Y1, rg))
+      return(log_prior + log_like)
+    })
+    
+    probs_r <- exp(log_dens_r - max(log_dens_r))
+    probs_r <- probs_r / sum(probs_r)
+    r <- sample(r_grid, size = 1, prob = probs_r)
+    
+    # Storage
+    if (iter > burn_in && (iter - burn_in) %% thin == 0) {
+      samples[store_idx, ] <- c(r, p, lambda)
+      store_idx <- store_idx + 1
+    }
   }
   
-  # Sample p ~ Beta(r * n + 1, sum(Y1) + 1)
-  p <- rbeta(1, r * n + 1, sum(Y1) + 1)
-  
-  # Sample lambda ~ Gamma(0.01 + sum(X - Y1), 0.01 + n)
-  lambda <- rgamma(1, shape = 0.01 + sum(X - Y1), rate = 0.01 + n)
-  lambda <- pmin(pmax(lambda, 0.01), 10)
-  
-  # Sample r using importance sampling
-  r <- sample_r(p, Y1, n, r)
-  
-  # Store samples with thinning
-  if (iter > burn_in && (iter - burn_in) %% thin == 0) {
-    r_samples[store_idx] <- r
-    p_samples[store_idx] <- p
-    lambda_samples[store_idx] <- lambda
-    store_idx <- store_idx + 1
-  }
-if (iter %% 100 == 0) {cat(paste0('  iteration: ', iter, '    '), '\r')}
+  return(mcmc(samples, start = burn_in + 1, end = n_iter, thin = thin))
 }
 
-# Summary statistics
-cat("Mean r:", mean(r_samples), "(True:", r_true, ")\n")
-cat("Mean p:", mean(p_samples), "(True:", p_true, ")\n")
-cat("Mean lambda:", mean(lambda_samples), "(True:", lambda_true, ")\n")
+# 4. Run 4 Chains with Diverse Starting Values
+cat("Running 4 Gibbs Chains...\n")
+chain1 <- run_delaporte_gibbs(X, init_r = 1.0, init_p = 0.2, init_lambda = 1.5)
+chain2 <- run_delaporte_gibbs(X, init_r = 4.0, init_p = 0.7, init_lambda = 4.5)
+chain3 <- run_delaporte_gibbs(X, init_r = 2.0, init_p = 0.5, init_lambda = 3.0)
+chain4 <- run_delaporte_gibbs(X, init_r = 6.0, init_p = 0.3, init_lambda = 2.0)
 
-# Posterior diagnostics and visualization
-par(mar = c(4, 5, 2, 1))
-layout(matrix(1:9, ncol = 3, nrow = 3, byrow = TRUE), widths = c(1.5, 1, 1), heights = c(1, 1, 1))
+mcmc_list <- mcmc.list(chain1, chain2, chain3, chain4)
 
-# r diagnostics
-plot(r_samples, col = "blue", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'r')
-acf(r_samples, lag.max = 100, main = 'r ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(r_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'r', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
+# 5. Convergence Verification Metrics
+cat("\n--- Gelman-Rubin Diagnostic (R-hat) ---\n")
+print(gelman.diag(mcmc_list)$psrf)
 
-# p diagnostics
-plot(p_samples, col = "darkgreen", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'p')
-acf(p_samples, lag.max = 100, main = 'p ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(p_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'p', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
+cat("\n--- Effective Sample Size (ESS) ---\n")
+print(effectiveSize(mcmc_list))
 
-# lambda diagnostics
-plot(lambda_samples, col = "purple", type = 'l', lwd = 1.5, 
-     cex.lab = 1.5, cex.axis = 1.5, xlab = 'Iteration', ylab = 'lambda')
-acf(lambda_samples, lag.max = 100, main = 'lambda ACF', lwd = 1.5, 
-    cex.lab = 1.5, cex.axis = 1.5)
-hist(lambda_samples, cex.lab = 1.5, cex.axis = 1.5, xlab = 'lambda', freq = FALSE, 
-     ylab = 'Posterior Density', col = 'lightgray', main = '')
+# 6. Plot Exact Diagnostic Panel (2x3 Layout)
+par(mfrow = c(3, 2), mar = c(4.5, 4.5, 2.5, 1.5))
 
+# Colors matching multi-chain trace overlay (Black, Red, Green, Blue)
+chain_cols <- c("black", "red", "green3", "deepskyblue")
 
+# Combine all post-burn-in iterations for ACF computation
+combined_samples <- as.matrix(mcmc_list)
+n_post <- nrow(chain1)
+
+# --- Row 1: r Parameter ---
+plot(1:n_post, chain1[, "r"], type = "l", col = chain_cols[1],
+     ylim = c(0, 12), xlab = "Post-burn-in iteration", ylab = "r",
+     main = "Trace: r")
+lines(1:n_post, chain2[, "r"], col = chain_cols[2])
+lines(1:n_post, chain3[, "r"], col = chain_cols[3])
+lines(1:n_post, chain4[, "r"], col = chain_cols[4])
+
+acf(combined_samples[, "r"], lag.max = 50, main = "ACF: r", ylab = "ACF", lwd = 1.5)
+
+# --- Row 2: p Parameter ---
+plot(1:n_post, chain1[, "p"], type = "l", col = chain_cols[1],
+     ylim = c(0, 1.0), xlab = "Post-burn-in iteration", ylab = "p",
+     main = "Trace: p")
+lines(1:n_post, chain2[, "p"], col = chain_cols[2])
+lines(1:n_post, chain3[, "p"], col = chain_cols[3])
+lines(1:n_post, chain4[, "p"], col = chain_cols[4])
+
+acf(combined_samples[, "p"], lag.max = 50, main = "ACF: p", ylab = "ACF", lwd = 1.5)
+
+# --- Row 3: lambda Parameter ---
+plot(1:n_post, chain1[, "lambda"], type = "l", col = chain_cols[1],
+     ylim = c(0.5, 5.5), xlab = "Post-burn-in iteration", ylab = "lambda",
+     main = "Trace: lambda")
+lines(1:n_post, chain2[, "lambda"], col = chain_cols[2])
+lines(1:n_post, chain3[, "lambda"], col = chain_cols[3])
+lines(1:n_post, chain4[, "lambda"], col = chain_cols[4])
+
+acf(combined_samples[, "lambda"], lag.max = 50, main = "ACF: lambda", ylab = "ACF", lwd = 1.5)
+
+# Reset plotting grid
+par(mfrow = c(1, 1))
